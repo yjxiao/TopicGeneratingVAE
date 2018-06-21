@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from model import TopGenVAE
 from data import Corpus, get_iterator, PAD_TOKEN
 from loss import seq_recon_loss, bow_recon_loss
-from loss import total_kld, kld_decomp
+from loss import total_kld
 
 
 parser = argparse.ArgumentParser(description='Text VAE')
@@ -34,8 +34,6 @@ parser.add_argument('--batch_size', type=int, default=32, metavar='N',
                     help="batch size")
 parser.add_argument('--dropout', type=float, default=0.2,
                     help="dropout applied to layers (0 = no dropout)")
-parser.add_argument('--no_decomp', action='store_true',
-                    help="use original kl instead of tc decomposition")
 parser.add_argument('--alpha', type=float, default=1.0,
                     help="weight of the mutual information term")
 parser.add_argument('--beta', type=float, default=1.0,

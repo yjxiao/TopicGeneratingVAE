@@ -205,14 +205,15 @@ class TopGenVAE(nn.Module):
                  code_size, num_topics, dropout):
         super().__init__()
         self.lookup = nn.Embedding(vocab_size, embed_size)
+        self.seq2counts = Seq2Counts(vocab_size)
         self.encode_seq = SeqEncoder(embed_size, hidden_size, dropout)
         self.encode_bow = BowEncoder(vocab_size, hidden_size, dropout)
-        self.decode_seq = SeqDecoder(embed_size, hidden_size, dropout)
-        self.decode_bow = BowDecoder(vocab_size, num_topics, dropout)
-        self.seq2counts = Seq2Counts(vocab_size)
         self.h2norm = Hidden2Normal   (hidden_size, code_size)
         self.h2lgnm = Hidden2LogNormal(hidden_size, num_topics)
+        self.z2lgnm = Code2LogNormal(code_size, hidden_size, num_topics)
         self.fuse = ConcatFuser(code_size, num_topics, hidden_size)
+        self.decode_seq = SeqDecoder(embed_size, hidden_size, dropout)
+        self.decode_bow = BowDecoder(vocab_size, num_topics, dropout)
         # output layer
         self.fcout = nn.Linear(hidden_size, vocab_size)
 
@@ -221,31 +222,32 @@ class TopGenVAE(nn.Module):
         enc_bow = self.seq2counts(inputs, pad_id)
         hn = self.encode_seq(enc_emb, lengths)
         h3 = self.encode_bow(enc_bow)
-        dist_norm = self.h2norm(hn)
-        dist_lgnm = self.h2lgnm(h3)
-        return dist_norm, dist_lgnm, enc_bow
+        posterior_z = self.h2norm(hn)
+        posterior_t = self.h2lgnm(h3)
+        return posterior_z, posterior_t, enc_bow
     
     def forward(self, inputs, lengths, pad_id):
-        dist_norm, dist_lgnm, enc_bow = self._encode(inputs, lengths, pad_id)
+        posterior_z, posterior_t, enc_bow = self._encode(inputs, lengths, pad_id)
         dec_emb = self.lookup(inputs)
         if self.training:
-            z = dist_norm.rsample()
-            t = dist_lgnm.rsample()
+            z = posterior_z.rsample()
+            t = posterior_t.rsample()
         else:
-            z = dist_norm.mean
-            t = dist_lgnm.mean
-        log_probs = self.decode_bow(t)
+            z = posterior_z.mean
+            t = posterior_t.mean
+        bow_outputs = self.decode_bow(t)
         hidden = self.fuse(z, t)
         outputs, _ = self.decode_seq(dec_emb, lengths, hidden)
-        outputs = self.fcout(outputs)
+        seq_outputs = self.fcout(outputs)
         results = Results()
         results.z = z
         results.t = t
         results.bow_targets = enc_bow
-        results.seq_outputs = outputs
-        results.bow_outputs = log_probs
-        results.posterior_z = dist_norm
-        results.posterior_t = dist_lgnm
+        results.seq_outputs = seq_outputs
+        results.bow_outputs = bow_outputs
+        results.posterior_z = posterior_z
+        results.prior_t = self.z2lgnm(z)
+        results.posterior_t = posterior_t
         return results
 
     def generate(self, z, t, max_length, sos_id):
@@ -255,7 +257,7 @@ class TopGenVAE(nn.Module):
         dec_inputs = torch.full((batch_size, 1), sos_id, dtype=torch.long, device=z.device)
         for k in range(max_length):
             dec_emb = self.lookup(dec_inputs)
-            outputs, hidden = self.decode(dec_emb, init_hidden=hidden)
+            outputs, hidden = self.decode_seq(dec_emb, init_hidden=hidden)
             outputs = self.fcout(outputs)
             dec_inputs = outputs.max(2)[1]
             generated[:, k] = dec_inputs[:, 0].clone()
@@ -263,15 +265,15 @@ class TopGenVAE(nn.Module):
     
     def reconstruct(self, inputs, lengths, pad_id, max_length, sos_id,
                     fix_z=True, fix_t=True):
-        dist_norm, dist_lgnm, _ = self._encode(inputs, lengths, pad_id)
+        posterior_z, posterior_t, _ = self._encode(inputs, lengths, pad_id)
         if fix_z:
-            z = dist_norm.mean
+            z = posterior_z.mean
         else:
-            z = dist_norm.sample()
+            z = posterior_z.sample()
         if fix_t:
-            t = dist_lgnm.mean
+            t = posterior_t.mean
         else:
-            t = dist_lgnm.sample()
+            t = posterior_t.sample()
         return self.generate(z, t, max_length, sos_id)
 
     def sample(self, num_samples, max_length, sos_id, device):
@@ -279,26 +281,26 @@ class TopGenVAE(nn.Module):
         Note that num_samples should not be too large. 
 
         """
-        code_size = self.fuse.in1_features
-        num_topics = self.fuse.in2_features
+        code_size = self.z2lgnm.fc1.in_features
         z = torch.randn(1, num_samples, code_size, device=device)
-        t = torch.randn(1, num_samples, num_topics, device=device).exp()
+        prior_t = self.z2lgnm(z)
+        t = prior_t.sample()
         return self.generate(z, t, max_length, sos_id)
 
     def get_topics(self, inputs, pad_id):
         enc_bow = self.seq2counts(inputs, pad_id)
         h3 = self.encode_bow(enc_bow)
-        dist_lgnm = self.h2lgnm(h3)
-        t = dist_lgnm.mean
+        posterior_t = self.h2lgnm(h3)
+        t = posterior_t.mean
         return t / t.sum(1, keepdim=True)
         
     def interpolate(self, input_pairs, length_pairs, pad_id, max_length, sos_id, num_pts=4):
         z_pairs = []
         t_pairs = []
         for inputs, lengths in zip(input_pairs, length_pairs):
-            dist_norm, dist_lgnm, _ = self._encode(inputs, lengths)
-            z = dist_norm.mean
-            t = dist_lgnm.mean
+            posterior_z, posterior_t, _ = self._encode(inputs, lengths)
+            z = posterior_z.mean
+            t = posterior_t.mean
             z_pairs.append(z)
             t_pairs.append(t)
         generated = []
