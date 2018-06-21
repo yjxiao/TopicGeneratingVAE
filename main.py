@@ -50,8 +50,6 @@ parser.add_argument('--seed', type=int, default=42,
                     help="random seed")
 parser.add_argument('--kla', action='store_true',
                     help="use kl annealing")
-parser.add_argument('--bow', action='store_true',
-                    help="add bag of words loss in training")
 parser.add_argument('--nocuda', action='store_true',
                     help="do not use CUDA")
 args = parser.parse_args()
@@ -68,9 +66,6 @@ def evaluate(data_iter, model, pad_id):
     bow_loss = 0.0
     kld_z = 0.0
     kld_t = 0.0
-    mi = 0.0
-    tc = 0.0
-    gwkl = 0.0
     seq_words = 0
     bow_words = 0
     for batch in data_iter:
@@ -86,27 +81,17 @@ def evaluate(data_iter, model, pad_id):
             results.bow_outputs, results.bow_targets
         )
         batch_kld_z = total_kld(results.posterior_z)
-        batch_kld_t = total_kld(results.posterior_t)
-        (log_qzx, log_qtx, log_qzt, log_qz, log_qt,
-         log_pz, log_pt) = kld_decomp(
-             results.posterior_z, results.z,
-             results.posterior_t, results.t
-        )
-        batch_mi = log_qzx + log_qtx - log_qzt
-        batch_tc = log_qzt - log_qz - log_qt
-        batch_gwkl = log_qz + log_qt - log_pz - log_pt
+        batch_kld_t = total_kld(results.posterior_t,
+                                results.prior_t).to(inputs.device)
         seq_loss += batch_seq.item() / size
         bow_loss += batch_bow.item() / size        
         kld_z += batch_kld_z.item() / size
         kld_t += batch_kld_t.item() / size
-        mi += batch_mi.item() * batch_size / size
-        tc += batch_tc.item() * batch_size / size
-        gwkl += batch_gwkl.item() * batch_size / size
         seq_words += torch.sum(lengths-1).item()
         bow_words += torch.sum(results.bow_targets)
     seq_ppl = math.exp(seq_loss * size / seq_words)
     bow_ppl = math.exp(bow_loss * size / bow_words)
-    return (seq_loss, bow_loss, kld_z, kld_t, mi, tc, gwkl,
+    return (seq_loss, bow_loss, kld_z, kld_t,
             seq_ppl, bow_ppl)
 
 
@@ -118,9 +103,6 @@ def train(data_iter, model, pad_id, optimizer, epoch):
     bow_loss = 0.0
     kld_z = 0.0
     kld_t = 0.0    
-    mi = 0.0
-    tc = 0.0
-    gwkl = 0.0
     seq_words = 0
     bow_words = 0
     for i, batch in enumerate(data_iter):
@@ -138,47 +120,25 @@ def train(data_iter, model, pad_id, optimizer, epoch):
             results.bow_outputs, results.bow_targets
         )
         batch_kld_z = total_kld(results.posterior_z)
-        batch_kld_t = total_kld(results.posterior_t)
-        (log_qzx, log_qtx, log_qzt, log_qz, log_qt,
-         log_pz, log_pt) = kld_decomp(
-             results.posterior_z, results.z,
-             results.posterior_t, results.t
-        )
-        batch_mi = log_qzx + log_qtx - log_qzt
-        batch_tc = log_qzt - log_qz - log_qt
-        batch_gwkl = log_qz + log_qt - log_pz - log_pt
+        batch_kld_t = total_kld(results.posterior_t,
+                                results.prior_t).to(inputs.device)
         
         seq_loss += batch_seq.item() / size
         bow_loss += batch_bow.item() / size        
         kld_z += batch_kld_z.item() / size
         kld_t += batch_kld_t.item() / size        
-        mi += batch_mi.item() * batch_size / size
-        tc += batch_tc.item() * batch_size / size
-        gwkl += batch_gwkl.item() * batch_size / size
         seq_words += torch.sum(lengths-1).item()
         bow_words += torch.sum(results.bow_targets)
         kld_weight = weight_schedule(args.epoch_size * (epoch - 1) + i) if args.kla else 1.
         optimizer.zero_grad()
-        if args.no_decomp:
-            kld_term = (batch_kld_z + batch_kld_t) / batch_size
-        else:
-            kld_term = args.alpha * (log_qzx + log_qtx) + (args.beta - args.alpha) * log_qzt +\
-                       (args.gamma - args.beta) * (log_qz + log_qt) - args.gamma * (log_pz + log_pt)
-            # print('log_qzx ', log_qzx)
-            # print('log_qtx ', log_qtx)
-            # print('log_qzt ', log_qzt)
-            # print('log_qz ', log_qz)
-            # print('log_qt ', log_qt)
-            # print('log_pz ', log_pz)
-            # print('log_pt ', log_pt)
-            # print(kld_term.item())
+        kld_term = (batch_kld_z + batch_kld_t) / batch_size
         loss = (batch_seq + batch_bow) / batch_size + kld_weight * kld_term
         loss.backward()
         optimizer.step()
     seq_ppl = math.exp(seq_loss * size / seq_words)
     bow_ppl = math.exp(bow_loss * size / bow_words)
         
-    return (seq_loss, bow_loss, kld_z, kld_t, mi, tc, gwkl,
+    return (seq_loss, bow_loss, kld_z, kld_t,
             seq_ppl, bow_ppl)
 
 
@@ -232,26 +192,24 @@ def main(args):
     try:
         for epoch in range(1, args.epochs+1):
             epoch_start_time = time.time()
-            (tr_seq_loss, tr_bow_loss, tr_kld_z, tr_kld_t, tr_mi,
-             tr_tc, tr_gwkl, tr_seq_ppl, tr_bow_ppl) = train(
+            (tr_seq_loss, tr_bow_loss, tr_kld_z, tr_kld_t,
+             tr_seq_ppl, tr_bow_ppl) = train(
                  train_iter, model, pad_id, optimizer, epoch
              )
-            (va_seq_loss, va_bow_loss, va_kld_z, va_kld_t, va_mi,
-             va_tc, va_gwkl, va_seq_ppl, va_bow_ppl) = evaluate(
+            (va_seq_loss, va_bow_loss, va_kld_z, va_kld_t,
+             va_seq_ppl, va_bow_ppl) = evaluate(
                  valid_iter, model, pad_id
              )
             print('-' * 90)
             meta = "| epoch {:2d} | time {:5.2f}s ".format(epoch, time.time()-epoch_start_time)
             print(meta + "| train loss {:5.2f} {:5.2f} ({:5.2f} {:5.2f}) "
-                  "| {:5.2f} {:5.2f} {:5.2f} "
                   "| train ppl {:5.2f} {:5.2f}".format(
-                      tr_seq_loss, tr_bow_loss, tr_kld_z, tr_kld_t, tr_mi,
-                      tr_tc, tr_gwkl, tr_seq_ppl, tr_bow_ppl))
+                      tr_seq_loss, tr_bow_loss, tr_kld_z, tr_kld_t,
+                      tr_seq_ppl, tr_bow_ppl))
             print(len(meta)*' ' + "| valid loss {:5.2f} {:5.2f} ({:5.2f} {:5.2f}) "
-                  "| {:5.2f} {:5.2f} {:5.2f} "
                   "| valid ppl {:5.2f} {:5.2f}".format(
-                      va_seq_loss, va_bow_loss, va_kld_z, va_kld_t, va_mi,
-                      va_tc, va_gwkl, va_seq_ppl, va_bow_ppl), flush=True)
+                      va_seq_loss, va_bow_loss, va_kld_z, va_kld_t,
+                      va_seq_ppl, va_bow_ppl), flush=True)
             epoch_loss = va_seq_loss + va_bow_loss + va_kld_z + va_kld_t
             if best_loss is None or epoch_loss < best_loss:
                 best_loss = epoch_loss
@@ -265,14 +223,13 @@ def main(args):
 
     with open(get_savepath(args), 'rb') as f:
         model = torch.load(f)
-    (te_seq_loss, te_bow_loss, te_kld_z, te_kld_t, te_mi, te_tc,
-     te_gwkl, te_seq_ppl, te_bow_ppl) = evaluate(test_iter, model, pad_id)
+    (te_seq_loss, te_bow_loss, te_kld_z, te_kld_t,
+     te_seq_ppl, te_bow_ppl) = evaluate(test_iter, model, pad_id)
     print('=' * 90)
     print("| End of training | test loss {:5.2f} {:5.2f} ({:5.2f} {:5.2f}) "
-          "| {:5.2f} {:5.2f} {:5.2f} "
           "| test ppl {:5.2f} {:5.2f}".format(
-              te_seq_loss, te_bow_loss, te_kld_z, te_kld_t, te_mi,
-              te_tc, te_gwkl, te_seq_ppl, te_bow_ppl))
+              te_seq_loss, te_bow_loss, te_kld_z, te_kld_t,
+              te_seq_ppl, te_bow_ppl))
     print('=' * 90)
 
 
