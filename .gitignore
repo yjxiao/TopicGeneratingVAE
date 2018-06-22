@@ -1,5 +1,6 @@
 *~
 *.pyc
+*.log
 data/*
 saves/*
 __pycache__/*

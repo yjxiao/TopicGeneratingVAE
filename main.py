@@ -22,7 +22,7 @@ parser.add_argument('--embed_size', type=int, default=200,
                     help="size of the word embedding")
 parser.add_argument('--label_embed_size', type=int, default=8,
                     help="size of the label embedding")
-parser.add_argument('--hidden_size', type=int, default=256,
+parser.add_argument('--hidden_size', type=int, default=200,
                     help="number of hidden units for RNN")
 parser.add_argument('--code_size', type=int, default=32,
                     help="latent code dimension")
@@ -142,6 +142,67 @@ def train(data_iter, model, pad_id, optimizer, epoch):
             seq_ppl, bow_ppl)
 
 
+def train_alt(data_iter, model, pad_id, optimizer, epoch):
+    model.train()
+    data_iter.init_epoch()
+    size = min(len(data_iter.data()), args.epoch_size * args.batch_size)
+    seq_loss = 0.0
+    bow_loss = 0.0
+    kld_z = 0.0
+    kld_t = 0.0    
+    seq_words = 0
+    bow_words = 0
+    for i, batch in enumerate(data_iter):
+        if i == args.epoch_size:
+            break
+        texts, lengths = batch.text
+        batch_size = texts.size(0)
+        inputs = texts[:, :-1].clone()
+        targets = texts[:, 1:].clone()
+        results = model(inputs, lengths-1, pad_id)
+        batch_bow = bow_recon_loss(
+            results.bow_outputs, results.bow_targets
+        )
+        batch_kld_t = total_kld(results.posterior_t,
+                                results.prior_t).to(inputs.device)
+        
+        bow_loss += batch_bow.item() / size        
+        kld_t += batch_kld_t.item() / size        
+        bow_words += torch.sum(results.bow_targets)
+        optimizer.zero_grad()
+        kld_term = batch_kld_t
+        loss = batch_bow + kld_term
+        loss.backward()
+        optimizer.step()
+    data_iter.init_epoch()        
+    for i, batch in enumerate(data_iter):
+        if i == args.epoch_size:
+            break
+        texts, lengths = batch.text
+        batch_size = texts.size(0)
+        inputs = texts[:, :-1].clone()
+        targets = texts[:, 1:].clone()
+        results = model(inputs, lengths-1, pad_id)
+        batch_seq = seq_recon_loss(
+            results.seq_outputs, targets, pad_id
+        )
+        batch_kld_z = total_kld(results.posterior_z)
+        
+        seq_loss += batch_seq.item() / size
+        kld_z += batch_kld_z.item() / size
+        seq_words += torch.sum(lengths-1).item()
+        kld_weight = weight_schedule(args.epoch_size * (epoch - 1) + i) if args.kla else 1.
+        optimizer.zero_grad()
+        kld_term = batch_kld_z
+        loss = batch_seq + kld_weight * kld_term
+        loss.backward()
+        optimizer.step()
+    seq_ppl = math.exp(seq_loss * size / seq_words)
+    bow_ppl = math.exp(bow_loss * size / bow_words)
+    return (seq_loss, bow_loss, kld_z, kld_t,
+            seq_ppl, bow_ppl)
+
+
 def interpolate(i, start, duration):
     return max(min((i - start) / duration, 1), 0)
 
@@ -153,7 +214,7 @@ def weight_schedule(t):
 
 def get_savepath(args):
     dataset = args.data.rstrip('/').split('/')[-1]
-    path = './saves/emb{0:d}.hid{1:d}.z{2:d}.t{3:d}{4}{5}.{6}.pt'.format(
+    path = './saves/emb{0:d}.hid{1:d}.z{2:d}.t{3:d}{4}{5}.{6}.weighted.pt'.format(
         args.embed_size, args.hidden_size, args.code_size, args.num_topics,
         '.wd{:.0e}'.format(args.wd) if args.wd > 0 else '',
         '.kla' if args.kla else '', dataset)
