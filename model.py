@@ -6,7 +6,7 @@ from torch.nn.utils.rnn import pad_packed_sequence as unpack
 from torch.distributions import Normal, LogNormal, Dirichlet
 
     
-class Seq2Counts(nn.Module):
+class SeqToBow(nn.Module):
     """Converts sequences of tokens to bag of words representations. """
     def __init__(self, vocab_size):
         super().__init__()
@@ -14,7 +14,7 @@ class Seq2Counts(nn.Module):
 
     def forward(self, inputs, ignore_index):
         # inputs dim: batch_size x max_len
-        counts = torch.zeros(
+        bow = torch.zeros(
             (inputs.size(0), self.vocab_size),
             dtype=torch.float,
             device=inputs.device
@@ -22,9 +22,9 @@ class Seq2Counts(nn.Module):
         ones = torch.ones_like(
             inputs, dtype=torch.float,
         )
-        counts.scatter_add_(1, inputs, ones)
-        counts[:, ignore_index] = 0
-        return counts
+        bow.scatter_add_(1, inputs, ones)
+        bow[:, ignore_index] = 0
+        return bow
 
 
 class SeqEncoder(nn.Module):
@@ -60,7 +60,7 @@ class BowEncoder(nn.Module):
         return h
 
 
-class Hidden2Normal(nn.Module):
+class HiddenToNormal(nn.Module):
     """
     Converts hidden state from the SeqEncoder to normal 
     distribution. Calculates q(z|x).
@@ -82,7 +82,7 @@ class Hidden2Normal(nn.Module):
         return dist
 
 
-class Hidden2LogNormal(nn.Module):
+class HiddenToLogNormal(nn.Module):
     """
     Converts hidden state from BowEncoder to log-normal
     distribution. Calculates q(t|x,z) = q(t|x)
@@ -103,7 +103,7 @@ class Hidden2LogNormal(nn.Module):
         return dist
 
 
-class Hidden2Dirichlet(nn.Module):
+class HiddenToDirichlet(nn.Module):
     """
     Converts hidden state from BowEncoder to dirichlet
     distribution. Calculates q(t|x,z) = q(t|x)
@@ -122,7 +122,7 @@ class Hidden2Dirichlet(nn.Module):
         return dist
 
 
-class Code2LogNormal(nn.Module):
+class CodeToLogNormal(nn.Module):
     """Calculates p(t|z). """
     def __init__(self, code_size, hidden_size, num_topics):
         super().__init__()
@@ -140,7 +140,7 @@ class Code2LogNormal(nn.Module):
         return dist
 
 
-class Code2Dirichlet(nn.Module):
+class CodeToDirichlet(nn.Module):
     """Calculates p(t|z). """
     def __init__(self, code_size, hidden_size, num_topics):
         super().__init__()
@@ -239,29 +239,33 @@ class TopGenVAE(nn.Module):
                  code_size, num_topics, dropout):
         super().__init__()
         self.lookup = nn.Embedding(vocab_size, embed_size)
-        self.seq2counts = Seq2Counts(vocab_size)
+        self.seq2bow = SeqToBow(vocab_size)
         self.encode_seq = SeqEncoder(embed_size, hidden_size, dropout)
         self.encode_bow = BowEncoder(vocab_size, hidden_size, dropout)
-        self.h2norm = Hidden2Normal   (hidden_size, code_size)
-        self.h2t = Hidden2Dirichlet(hidden_size, num_topics)
-        self.z2t = Code2Dirichlet(code_size, hidden_size, num_topics)
+        self.h2z = HiddenToNormal   (hidden_size, code_size)
+        self.h2t = HiddenToDirichlet(hidden_size, num_topics)
+        self.z2t = CodeToDirichlet(code_size, hidden_size, num_topics)
         self.fuse = ConcatFuser(code_size, num_topics, hidden_size)
         self.decode_seq = SeqDecoder(embed_size, hidden_size, dropout)
         self.decode_bow = BowDecoder(vocab_size, num_topics, dropout)
         # output layer
         self.fcout = nn.Linear(hidden_size, vocab_size)
 
-    def _encode(self, inputs, lengths, pad_id):
+    def _encode_z(self, inputs, lengths):
         enc_emb = self.lookup(inputs)
-        enc_bow = self.seq2counts(inputs, pad_id)
         hn = self.encode_seq(enc_emb, lengths)
-        h3 = self.encode_bow(enc_bow)
-        posterior_z = self.h2norm(hn)
+        posterior_z = self.h2z(hn)
+        return posterior_z
+
+    def _encode_t(self, inputs, pad_id):
+        bow_targets = self.seq2bow(inputs, pad_id)
+        h3 = self.encode_bow(bow_targets)
         posterior_t = self.h2t(h3)
-        return posterior_z, posterior_t, enc_bow
+        return posterior_t, bow_targets
     
     def forward(self, inputs, lengths, pad_id):
-        posterior_z, posterior_t, enc_bow = self._encode(inputs, lengths, pad_id)
+        posterior_z = self._encode_z(inputs, lengths)
+        posterior_t, bow_targets = self._encode_t(inputs, pad_id)
         dec_emb = self.lookup(inputs)
         if self.training:
             z = posterior_z.rsample()
@@ -276,7 +280,7 @@ class TopGenVAE(nn.Module):
         results = Results()
         results.z = z
         results.t = t
-        results.bow_targets = enc_bow
+        results.bow_targets = bow_targets
         results.seq_outputs = seq_outputs
         results.bow_outputs = bow_outputs
         results.posterior_z = posterior_z
@@ -322,9 +326,7 @@ class TopGenVAE(nn.Module):
         return self.generate(z, t, max_length, sos_id)
 
     def get_topics(self, inputs, pad_id):
-        enc_bow = self.seq2counts(inputs, pad_id)
-        h3 = self.encode_bow(enc_bow)
-        posterior_t = self.h2t(h3)
+        posterior_t = self._encode_t(inputs, pad_id)
         t = posterior_t.mean.to(inputs.device)
         return t / t.sum(1, keepdim=True)
         
