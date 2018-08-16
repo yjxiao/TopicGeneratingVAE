@@ -131,8 +131,8 @@ def train(data_iter, model, pad_id, optimizer, epoch):
         bow_words += torch.sum(results.bow_targets)
         kld_weight = weight_schedule(args.epoch_size * (epoch - 1) + i) if args.kla else 1.
         optimizer.zero_grad()
-        kld_term = (batch_kld_z + batch_kld_t) / batch_size
-        loss = (batch_seq + batch_bow) / batch_size + kld_weight * kld_term
+        kld_term = (batch_kld_z + batch_kld_t * args.beta) / batch_size
+        loss = (batch_seq + batch_bow * args.beta) / batch_size + kld_weight * kld_term
         loss.backward()
         optimizer.step()
     seq_ppl = math.exp(seq_loss * size / seq_words)
@@ -214,10 +214,10 @@ def weight_schedule(t):
 
 def get_savepath(args):
     dataset = args.data.rstrip('/').split('/')[-1]
-    path = './saves/emb{0:d}.hid{1:d}.z{2:d}.t{3:d}{4}{5}.{6}.weighted.pt'.format(
+    path = './saves/emb{0:d}.hid{1:d}.z{2:d}.t{3:d}{4}{5}.beta{6:.1f}.{7}.pt'.format(
         args.embed_size, args.hidden_size, args.code_size, args.num_topics,
         '.wd{:.0e}'.format(args.wd) if args.wd > 0 else '',
-        '.kla' if args.kla else '', dataset)
+        '.kla' if args.kla else '', args.beta, dataset)
     return path
 
 
