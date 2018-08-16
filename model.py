@@ -186,9 +186,23 @@ class ConcatFuser(nn.Module):
         return [x.contiguous() for x in torch.chunk(hidden, 2, 2)]
 
 
+class IdentityFuser(nn.Module):
+    """
+    Use only z to initialize the hidden state of SeqDecoder.
+
+    """
+    def __init__(self, code_size, hidden_size):
+        super().__init__()
+        self.fc = nn.Linear(code_size, hidden_size * 2)
+
+    def forward(self, z):
+        hidden = F.tanh(self.fc(z)).unsqueeze(0)
+        return [x.contiguous() for x in torch.chunk(hidden, 2, 2)]
+
+
 class SeqDecoder(nn.Module):
     """
-    Decodes into sequences. Calculates p(x|z,t).
+    Decodes into sequences. Calculates p(x|z).
 
     """
     def __init__(self, input_size, hidden_size, dropout):
@@ -245,7 +259,7 @@ class TopGenVAE(nn.Module):
         self.h2z = HiddenToNormal   (hidden_size, code_size)
         self.h2t = HiddenToDirichlet(hidden_size, num_topics)
         self.z2t = CodeToDirichlet(code_size, hidden_size, num_topics)
-        self.fuse = ConcatFuser(code_size, num_topics, hidden_size)
+        self.fuse = IdentityFuser(code_size, hidden_size)
         self.decode_seq = SeqDecoder(embed_size, hidden_size, dropout)
         self.decode_bow = BowDecoder(vocab_size, num_topics, dropout)
         # output layer
@@ -274,7 +288,7 @@ class TopGenVAE(nn.Module):
             z = posterior_z.mean
             t = posterior_t.mean.to(z.device)
         bow_outputs = self.decode_bow(t)
-        hidden = self.fuse(z, t)
+        hidden = self.fuse(z)
         outputs, _ = self.decode_seq(dec_emb, lengths, hidden)
         seq_outputs = self.fcout(outputs)
         results = Results()
@@ -288,9 +302,9 @@ class TopGenVAE(nn.Module):
         results.posterior_t = posterior_t
         return results
 
-    def generate(self, z, t, max_length, sos_id):
+    def generate(self, z, max_length, sos_id):
         batch_size = z.size(0)
-        hidden = self.fuse(z, t)
+        hidden = self.fuse(z)
         generated = torch.zeros((batch_size, max_length), dtype=torch.long, device=z.device)
         dec_inputs = torch.full((batch_size, 1), sos_id, dtype=torch.long, device=z.device)
         for k in range(max_length):
@@ -312,7 +326,7 @@ class TopGenVAE(nn.Module):
             t = posterior_t.mean.to(z.device)
         else:
             t = posterior_t.sample().to(z.device)
-        return self.generate(z, t, max_length, sos_id)
+        return self.generate(z, max_length, sos_id)
 
     def sample(self, num_samples, max_length, sos_id, device):
         """Randomly sample latent code to sample texts. 
@@ -323,7 +337,7 @@ class TopGenVAE(nn.Module):
         z = torch.randn(1, num_samples, code_size, device=device)
         prior_t = self.z2t(z)
         t = prior_t.sample().to(device)
-        return self.generate(z, t, max_length, sos_id)
+        return self.generate(z, max_length, sos_id)
 
     def get_topics(self, inputs, pad_id):
         posterior_t = self._encode_t(inputs, pad_id)
@@ -343,7 +357,7 @@ class TopGenVAE(nn.Module):
         for i in range(num_pts+2):
             z = _interpolate(z_pairs, i, num_pts+2)
             t = _interpolate(t_pairs, i, num_pts+2)
-            generated.append(self.generate(z, t, max_length, sos_id))
+            generated.append(self.generate(z, max_length, sos_id))
         return generated
 
 

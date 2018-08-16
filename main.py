@@ -42,7 +42,7 @@ parser.add_argument('--gamma', type=float, default=1.0,
                     help="weight of the dimension-wise kl term")
 parser.add_argument('--lr', type=float, default=1e-3,
                     help="learning rate")
-parser.add_argument('--wd', type=float, default=0,
+parser.add_argument('--wd', type=float, default=1e-5,
                     help="weight decay used for regularization")
 parser.add_argument('--epoch_size', type=int, default=2000,
                     help="number of training steps in an epoch")
